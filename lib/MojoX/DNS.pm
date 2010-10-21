@@ -188,7 +188,7 @@ sub _find_dns {
     my @resolv = <F>;
     close F;
     chomp @resolv;
-    foreach my $l (grep /nameserver/, @resolv) {
+    foreach my $l (grep /^\s*nameserver/, @resolv) {
         $l=~m{nameserver\s+([^\s]+)};
         push @servers, $1;
     }
