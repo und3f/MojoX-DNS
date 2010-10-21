@@ -6,28 +6,34 @@ use warnings;
 use base 'Mojo::Base';
 our $VERSION = '0.01';
 
-use IO::Socket;
-use Mojo::IOLoop;
+use IO::Socket ();
+use Mojo::IOLoop ();
+use Carp ();
 
 __PACKAGE__->attr('ioloop'  => sub{ Mojo::IOLoop->singleton });
 __PACKAGE__->attr('dns'     => \&_find_dns );
 __PACKAGE__->attr('dns_port'=> 53 );
+__PACKAGE__->attr('error');
+__PACKAGE__->attr('timeout' => 15 );
+
+my $TYPE_A    = 0x0001;
+my $TYPE_AAAA = 0x001c;
 
 sub resolve {
-    my ($self, $name, $cb) = @_;
+    my ($self, $name, $query_type, $cb) = @_;
+
+    if (ref $query_type eq 'CODE') {
+        $cb   = $query_type;
+        $query_type = 'A';
+    }
 
     # TODO: spice must flow
-    my $transaction_id = int(rand(0x10000));
+    my $transaction_id = int( rand(0x10000) );
     my $flags          = 0x0100; # Standard query with recursion
     my $question       = 1;
     my $answer_rr      = 0;
     my $authority_rr   = 0;
     my $additional_rr  = 0;
-
-    # Query in $name
-
-    my $type           = 0x0001; # A
-    my $class          = 0x0001; # IN
 
     # Build packet header (just for 1 query)
     my $packet         = pack( 'nnnnnn',
@@ -35,7 +41,19 @@ sub resolve {
         $answer_rr, $authority_rr, $additional_rr,
     );
 
+    # Query
     my $query;
+    my $type;
+    my $class          = 0x0001; # IN
+
+    if ($query_type eq 'A') {
+        $type =  $TYPE_A;
+    } elsif ($query_type eq 'AAAA') {
+        $type =  $TYPE_AAAA;
+    } else {
+        Carp::croak "Unsupported query type \"$query_type\"";
+    }
+
     foreach my $part (split /\./, $name) {
         $query .= pack('C/a', $part) if $part;
     }
@@ -44,8 +62,24 @@ sub resolve {
 
     $packet .= $query;
 
-    my $socket = $self->ioloop->connect(
-        address  => $self->dns,
+    my $session = {
+        packet  => $packet,
+        cb      => $cb,
+        dns     => 0,
+        transaction => $transaction_id,
+    };
+
+    $self->_send_request( $session );
+}
+
+sub _send_request {
+    my ($self, $session) = @_;
+
+    my $timeout;
+    my $socket;
+
+    $socket = $self->ioloop->connect(
+        address  => $self->dns->[$session->{dns}],
         port     => $self->dns_port,
         args     => {
             Proto    => 'udp',
@@ -53,35 +87,66 @@ sub resolve {
         },
         on_connect => sub {
             my ($loop, $id) = @_;
-            $loop->write($id, $packet);
-        },
-        on_hup => sub {
-            cb->(undef);
+            $loop->write($id, $session->{packet});
         },
         on_error => sub {
             my ($loop, $id, $error) = @_;
-            warn $error;
-            $cb->(undef);
+            $self->_process_error( $session, $socket, $timeout, $error );
         },
         on_read  => sub {
             my ($loop, $id, $chunk) = @_;
-            $loop->drop( $id );
 
-            my @ips = $self->_parse_reply( $chunk );
-            $cb->(\@ips);
+            if ( my $error = $self->_process_reply( $session, $chunk ) ) {
+                $self->_process_error( $session, $socket, $timeout, $error );
+            }
+            # Otherwise user got result
         }
-);
+    );
 
+    $timeout = $self->ioloop->timer(
+        $self->timeout => sub {
+            $self->_process_error( $session, $socket, $timeout, "timeout" );
+        }
+    );
 }
 
-sub _parse_reply {
-    my ($self, $reply_packet) = @_;
+sub _process_error {
+    my ($self, $session, $socket, $timeout, $error) = @_;
+
+    $self->ioloop->drop( $socket );
+    $self->ioloop->drop( $timeout );
+
+    # Try next DNS
+    unless ( $self->dns->[++$session->{dns}]) {
+        $self->error( $error );
+        $session->{cb}( undef );
+    } else {
+        $self->_send_request( $session );
+    }
+}
+
+sub _process_reply {
+    my ($self, $session, $reply_packet) = @_;
 
     my @answers;
     my ($transaction, $flags, $questions,
         $answer_rr, $authority_rr,
         $additional_rr, $rest)
         = unpack ('nnnnnnA*', $reply_packet);
+
+    # Wrong transaction?
+    unless ($session->{transaction} == $transaction) {
+        return "Wrong transaction id";
+    }
+
+    unless ($flags & 0x8000) {
+        return "Not a response";
+    }
+
+    if (my $reply_code = ($flags & 0xf)) {
+        return sprintf "Got error reply code: %X", $reply_code;
+    }
+
     # Drop queries
     # print $rest;
     for (1..$questions) {
@@ -97,17 +162,34 @@ sub _parse_reply {
             unpack('nnnNn/AA*', $rest);
             #push @answers, $addr;
         # Unpack addr
-        my @ip = unpack('C' . length($addr), $addr);
-        push @answers, join('.', @ip);
+        if ($type == $TYPE_A) {
+            my @result = unpack('C' . length($addr), $addr);
+            push @answers, join('.', @result);
+        } elsif ($type == $TYPE_AAAA) {
+            my @result = unpack('n' . (length($addr)>>1), $addr);
+            push @answers, sprintf('%x:%x:%x:%x:%x:%x:%x:%x', @result);
+        }
         $rest = $r;
     }
 
-    return @answers;
+    # Return data to callback
+    $session->{cb}->( \@answers );
+
+    return undef;
 }
 
 sub _find_dns {
-    # TODO: parse resolve.conf
-    return '8.8.8.8';
+    my @servers;
+    open F, '/etc/resolv.conf' or Carp::croak "Can't open /etc/resolv.conf: $!";
+    my @resolv = <F>;
+    close F;
+    chomp @resolv;
+    foreach my $l (grep /nameserver/, @resolv) {
+        $l=~m{nameserver\s+([^\s]+)};
+        push @servers, $1;
+    }
+    Carp::croak "Got no DNS server" unless @servers;
+    return \@servers;
 }
 
 
