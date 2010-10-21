@@ -99,8 +99,11 @@ sub _send_request {
 
             if ( my $error = $self->_process_reply( $session, $chunk ) ) {
                 $self->_process_error( $session, $socket, $timeout, $error );
+            } else {
+                # Otherwise user got result
+                $self->ioloop->drop( $socket );
+                $self->ioloop->drop( $timeout );
             }
-            # Otherwise user got result
         }
     );
 
