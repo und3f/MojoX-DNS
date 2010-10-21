@@ -70,6 +70,7 @@ sub resolve {
     };
 
     $self->_send_request( $session );
+    return $self;
 }
 
 sub _send_request {
